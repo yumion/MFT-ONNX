@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from MFT.RAFT.core.update import BasicUpdateBlock, SmallUpdateBlock, OcclusionAndUncertaintyBlock
+from MFT.RAFT.core.corr import AlternateCorrBlock, CorrBlock
 from MFT.RAFT.core.extractor import BasicEncoder, SmallEncoder
-from MFT.RAFT.core.corr import CorrBlock, AlternateCorrBlock
+from MFT.RAFT.core.update import BasicUpdateBlock, OcclusionAndUncertaintyBlock, SmallUpdateBlock
 from MFT.RAFT.core.utils.utils import coords_grid, upflow8, upsample8
 
 try:
@@ -14,57 +14,79 @@ except:
     class autocast:
         def __init__(self, enabled):
             pass
+
         def __enter__(self):
             pass
+
         def __exit__(self, *args):
             pass
 
 
 class RAFT(nn.Module):
-    def __init__(self, args):
+    def __init__(
+        self,
+        iters: int = 12,
+        occlusion_module: str = "separate_with_uncertainty",
+        dropout: float = 0.1,
+        small: bool = False,
+        OU_last_iter_only: bool = False,
+        relu_uncertainty: bool = False,
+        alternate_corr: bool = False,
+        mixed_precision: bool = False,
+        normalized_features: bool = False,
+        experimental_cleanup: bool = False,
+        occlusion_input_detach: bool = False,
+        uncertainty_input_detach: bool = False,
+    ):
         super(RAFT, self).__init__()
-        self.args = args
 
-        self.occlusion_estimation = args.occlusion_module is not None
-        self.uncertainty_estimation = self.occlusion_estimation and 'with_uncertainty' in args.occlusion_module
-        self.OU_last_iter_only = getattr(args, 'OU_last_iter_only', False)
-        self.relu_uncertainty = getattr(args, 'relu_uncertainty', False)
+        self.occlusion_estimation = occlusion_module is not None
+        self.uncertainty_estimation = (
+            self.occlusion_estimation and "with_uncertainty" in occlusion_module
+        )
+        self.OU_last_iter_only = OU_last_iter_only
+        self.relu_uncertainty = relu_uncertainty
         if self.uncertainty_estimation:
-            self.mult_uncetrainty_upsample = 8.0 if 'upsample8' in args.occlusion_module else 1.0
+            self.mult_uncetrainty_upsample = 8.0 if "upsample8" in occlusion_module else 1.0
             self.eps_uncertainty = 10e-4
 
-        if args.small:
+        # feature network, context network, and update block
+        if small:
             self.hidden_dim = hdim = 96
             self.context_dim = cdim = 64
-            args.corr_levels = 4
-            args.corr_radius = 3
-        
+            self.corr_levels = 4
+            self.corr_radius = 3
+            self.fnet = SmallEncoder(output_dim=128, norm_fn="instance", dropout=dropout)
+            self.cnet = SmallEncoder(output_dim=hdim + cdim, norm_fn="none", dropout=dropout)
+            self.update_block = SmallUpdateBlock(
+                self.corr_levels, self.corr_radius, hidden_dim=hdim
+            )
+
         else:
             self.hidden_dim = hdim = 128
             self.context_dim = cdim = 128
-            args.corr_levels = 4
-            args.corr_radius = 4
+            self.corr_levels = 4
+            self.corr_radius = 4
             self.size_occl_uncer_input_dims = 712
 
-        if 'dropout' not in self.args:
-            self.args.dropout = 0
+            self.fnet = BasicEncoder(output_dim=256, norm_fn="instance", dropout=dropout)
+            self.cnet = BasicEncoder(output_dim=hdim + cdim, norm_fn="batch", dropout=dropout)
+            self.update_block = BasicUpdateBlock(
+                self.corr_levels, self.corr_radius, hidden_dim=hdim
+            )
 
-        if 'alternate_corr' not in self.args:
-            self.args.alternate_corr = False
+        self.alternate_corr = alternate_corr
+        self.mixed_precision = mixed_precision
+        self.normalized_features = normalized_features
+        self.experimental_cleanup = experimental_cleanup
 
-        # feature network, context network, and update block
-        if args.small:
-            self.fnet = SmallEncoder(output_dim=128, norm_fn='instance', dropout=args.dropout)        
-            self.cnet = SmallEncoder(output_dim=hdim+cdim, norm_fn='none', dropout=args.dropout)
-            self.update_block = SmallUpdateBlock(self.args, hidden_dim=hdim)
-
-        else:
-            self.fnet = BasicEncoder(output_dim=256, norm_fn='instance', dropout=args.dropout)        
-            self.cnet = BasicEncoder(output_dim=hdim+cdim, norm_fn='batch', dropout=args.dropout)
-            self.update_block = BasicUpdateBlock(self.args, hidden_dim=hdim)
-
-        if args.occlusion_module is not None:
-            self.occlusion_block = OcclusionAndUncertaintyBlock(self.args, hidden_dim=self.size_occl_uncer_input_dims)
+        if occlusion_module is not None:
+            self.occlusion_block = OcclusionAndUncertaintyBlock(
+                occlusion_module,
+                occlusion_input_detach,
+                uncertainty_input_detach,
+                hidden_dim=self.size_occl_uncer_input_dims,
+            )
 
     def freeze_bn(self):
         for m in self.modules():
@@ -72,29 +94,40 @@ class RAFT(nn.Module):
                 m.eval()
 
     def initialize_flow(self, img):
-        """ Flow is represented as difference between two coordinate grids flow = coords1 - coords0"""
+        """Flow is represented as difference between two coordinate grids flow = coords1 - coords0"""
         N, C, H, W = img.shape
-        coords0 = coords_grid(N, H//8, W//8).to(img.device)
-        coords1 = coords_grid(N, H//8, W//8).to(img.device)
+        coords0 = coords_grid(N, H // 8, W // 8).to(img.device)
+        coords1 = coords_grid(N, H // 8, W // 8).to(img.device)
 
         # optical flow computed as difference: flow = coords1 - coords0
         return coords0, coords1
 
     def upsample_flow(self, flow, mask, mult_coef=8.0, n_channels=2):
-        """ Upsample flow field [H/8, W/8, 2] -> [H, W, 2] using convex combination """
+        """Upsample flow field [H/8, W/8, 2] -> [H, W, 2] using convex combination"""
         N, _, H, W = flow.shape
         mask = mask.view(N, 1, 9, 8, 8, H, W)
         mask = torch.softmax(mask, dim=2)
 
-        up_flow = F.unfold(mult_coef * flow, [3,3], padding=1)
+        up_flow = F.unfold(mult_coef * flow, [3, 3], padding=1)
         up_flow = up_flow.view(N, n_channels, 9, 1, 1, H, W)
 
         up_flow = torch.sum(mask * up_flow, dim=2)
         up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
-        return up_flow.reshape(N, n_channels, 8*H, 8*W)
+        return up_flow.reshape(N, n_channels, 8 * H, 8 * W)
 
-
-    def forward(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False, normalise_input=True, return_features=False, return_coords=True, vis_debug=False):
+    def forward(
+        self,
+        image1,
+        image2,
+        iters=12,
+        flow_init=None,
+        upsample=True,
+        test_mode=False,
+        normalise_input=True,
+        return_features=False,
+        return_coords=True,
+        vis_debug=False,
+    ):
         """
         Estimate optical flow, occlusion and uncertainty between pair of frames
 
@@ -130,19 +163,23 @@ class RAFT(nn.Module):
         cdim = self.context_dim
 
         # run the feature network
-        with autocast(enabled=self.args.mixed_precision):
-            fmap1, fmap2 = self.fnet([image1, image2])        
-        
+        with autocast(enabled=self.mixed_precision):
+            fmap1, fmap2 = self.fnet([image1, image2])
+
         fmap1 = fmap1.float()
         fmap2 = fmap2.float()
-        if self.args.alternate_corr:
-            corr_fn = AlternateCorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
+        if self.alternate_corr:
+            corr_fn = AlternateCorrBlock(fmap1, fmap2, radius=self.corr_radius)
         else:
-            corr_fn = CorrBlock(fmap1, fmap2, radius=self.args.corr_radius,
-                                normalized_features=getattr(self.args, 'normalized_features', False))
+            corr_fn = CorrBlock(
+                fmap1,
+                fmap2,
+                radius=self.corr_radius,
+                normalized_features=self.normalized_features,
+            )
 
         # run the context network
-        with autocast(enabled=self.args.mixed_precision):
+        with autocast(enabled=self.mixed_precision):
             cnet = self.cnet(image1)
             net, inp = torch.split(cnet, [hdim, cdim], dim=1)
             net = torch.tanh(net)
@@ -165,19 +202,19 @@ class RAFT(nn.Module):
                 # the shape is (batch * h1 * w1, dim, h2, w2) with h1, w1
                 # being from reference image (H/8, W/8) and h2, w2 from
                 # the right image (size depends on pyramid level floor(h / # 2**lvl))
-                'costvolume_pyramid': [lvl.detach().cpu() for lvl in corr_fn.corr_pyramid],
+                "costvolume_pyramid": [lvl.detach().cpu() for lvl in corr_fn.corr_pyramid],
                 # coordinates with shape (1, xy(2), h1, w1)
-                'coords_left': coords0.detach().cpu(),
-                'iterations': [],
+                "coords_left": coords0.detach().cpu(),
+                "iterations": [],
             }
         for itr in range(iters):
             coords1 = coords1.detach()
             if vis_debug:
-                debug_stuff['iterations'].append({'coords': coords1.cpu()})
-            corr = corr_fn(coords1) # index correlation volume
+                debug_stuff["iterations"].append({"coords": coords1.cpu()})
+            corr = corr_fn(coords1)  # index correlation volume
 
             flow = coords1 - coords0
-            with autocast(enabled=self.args.mixed_precision):
+            with autocast(enabled=self.mixed_precision):
                 net, up_mask, delta_flow, motion_features = self.update_block(net, inp, corr, flow)
 
             # F(t+1) = F(t) + \Delta(t)
@@ -188,7 +225,7 @@ class RAFT(nn.Module):
                 flow_up = upflow8(coords1 - coords0)
             else:
                 flow_up = self.upsample_flow(coords1 - coords0, up_mask)
-            
+
             flow_predictions.append(flow_up)
 
             # in test time - occlusion and uncertainty estimated only for LAST iteration
@@ -196,30 +233,40 @@ class RAFT(nn.Module):
                 continue
 
             if self.occlusion_estimation:
-                occlusion, uncertainty = self.occlusion_block(net.detach(),  # hidden GRU state
-                                                              inp,  # context features
-                                                              corr.detach(),  # correlation cost-volume + pyramid
-                                                                              # ^ sampled at the previous flow position
-                                                              (coords1 - coords0).detach(),  # flow
-                                                              delta_flow.detach(),  # flow delta in last step
-                                                              motion_features  # encoded cost-volume sample + flow
-                                                              )
+                occlusion, uncertainty = self.occlusion_block(
+                    net.detach(),  # hidden GRU state
+                    inp,  # context features
+                    corr.detach(),  # correlation cost-volume + pyramid
+                    # ^ sampled at the previous flow position
+                    (coords1 - coords0).detach(),  # flow
+                    delta_flow.detach(),  # flow delta in last step
+                    motion_features,  # encoded cost-volume sample + flow
+                )
 
                 if up_mask is None:
                     occl_up = upsample8(occlusion)  # upsample only
                 else:
-                    occl_up = self.upsample_flow(occlusion, up_mask, mult_coef=1.0)  # upsample only
+                    occl_up = self.upsample_flow(
+                        occlusion, up_mask, mult_coef=1.0
+                    )  # upsample only
                 occl_predictions.append(occl_up)
 
                 if self.uncertainty_estimation:
                     if up_mask is None:
-                        uncertainty_up = upsample8(uncertainty) * self.mult_uncetrainty_upsample # upsample and multiply by 8 or 1
+                        uncertainty_up = (
+                            upsample8(uncertainty) * self.mult_uncetrainty_upsample
+                        )  # upsample and multiply by 8 or 1
                     else:
-                        uncertainty_up = self.upsample_flow(uncertainty, up_mask, mult_coef=self.mult_uncetrainty_upsample, n_channels=1) # upsample and multiply by 8
+                        uncertainty_up = self.upsample_flow(
+                            uncertainty,
+                            up_mask,
+                            mult_coef=self.mult_uncetrainty_upsample,
+                            n_channels=1,
+                        )  # upsample and multiply by 8
                         if self.relu_uncertainty:
                             uncertainty_up = F.relu(uncertainty_up)
 
-                        if getattr(self.args, 'experimental_cleanup', False):
+                        if self.experimental_cleanup:
                             uncertainty_up[~torch.isfinite(uncertainty_up)] = 35
                             uncertainty_up[uncertainty_up > 35] = 35
                             # print('cleaning up the mess')
@@ -232,28 +279,28 @@ class RAFT(nn.Module):
 
         outputs = dict()
         if test_mode:
-            outputs['flow'] = flow_up
+            outputs["flow"] = flow_up
             if self.uncertainty_estimation:
-                outputs['uncertainty'] = uncertainty_up
+                outputs["uncertainty"] = uncertainty_up
             if self.occlusion_estimation:
-                outputs['occlusion'] = occl_up
+                outputs["occlusion"] = occl_up
 
         else:
-            outputs['flow'] = flow_predictions
+            outputs["flow"] = flow_predictions
             if self.uncertainty_estimation:
-                outputs['uncertainty'] = uncertainty_predictions
+                outputs["uncertainty"] = uncertainty_predictions
             if self.occlusion_estimation:
-                outputs['occlusion'] = occl_predictions
+                outputs["occlusion"] = occl_predictions
 
         if return_features:
             context_features = torch.cat([cnet, fmap1], dim=1)
-            outputs['features'] = context_features
+            outputs["features"] = context_features
 
         if return_coords:
-            outputs['coords'] = coords1 - coords0
+            outputs["coords"] = coords1 - coords0
 
         if vis_debug:
-            debug_stuff['iterations'].append({'coords': coords1.cpu()}) # after last iteration
-            outputs['debug'] = debug_stuff
+            debug_stuff["iterations"].append({"coords": coords1.cpu()})  # after last iteration
+            outputs["debug"] = debug_stuff
 
         return outputs
