@@ -1,30 +1,25 @@
 import logging
-from pathlib import Path
 
-import einops
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from MFT.RAFT.core.raft import RAFT  # noqa: E402
 from MFT.RAFT.core.utils.utils import InputPadder  # noqa: E402
-from MFT.utils.geom_utils import get_featuremap_coords, torch_get_featuremap_coords
-from MFT.utils.misc import ensure_numpy
 
 logger = logging.getLogger(__name__)
 
 
-class RAFTWrapper:
+class RAFTWrapper(nn.Module):
     def __init__(
         self,
-        checkpoint_path: str = "checkpoints/raft-things-sintel-kubric-splitted-occlusion-uncertainty-non-occluded-base-sintel.pth",
+        checkpoint_path: str,
+        flow_iters: int = 12,
         occlusion_module: str = "separate_with_uncertainty",
         small: bool = False,
         mixed_precision: bool = False,
-        flow_iters: int = 12,
-        flow_cache_dir: Path = Path("flow_cache/RAFTou_kubric_huber_split_nonoccl/"),
-        flow_cache_ext: str = ".flowouX16.pkl",
-        name: str = "RAFTou_kubric_huber_split_nonoccl",
     ):
+        super().__init__()
         device = "cuda"
         self.flow_iters = flow_iters
 
@@ -44,96 +39,32 @@ class RAFTWrapper:
 
         self.model = model
 
-    def compute_flow(
-        self,
-        src_img,
-        dst_img,
-        mode="TC",
-        vis=False,
-        src_img_identifier=None,
-        numpy_out=False,
-        init_flow=None,
-        vis_debug=False,
-    ):
+    def forward(self, image1: torch.Tensor, image2: torch.Tensor):
         """
-        args:
-            src_img: (H, W, 3) uint8 BGR opencv image
-            dst_img: (H, W, 3) uint8 BGR opencv image
-            mode: one of "flow" or "TC"
-            init_flow: (xy H W) flow
+        Args:
+            image1 (torch.Tensor): The first image tensor, shape (1, 3, H, W).
+            image2 (torch.Tensor): The second image tensor, shape (1, 3, H, W).
+        Returns:
+            torch.Tensor: Predicted flow tensor, shape (1, 2, H, W).
         """
-        H, W = src_img.shape[:2]
-        # the_flow_timer = time_measurer('ms')
-        image1 = einops.rearrange(
-            torch.from_numpy(src_img[:, :, ::-1].copy()), "H W C -> 1 C H W", C=3
-        )
-        image2 = einops.rearrange(
-            torch.from_numpy(dst_img[:, :, ::-1].copy()), "H W C -> 1 C H W", C=3
-        )
-        image1, image2 = image1.cuda().float(), image2.cuda().float()
-
         padder = InputPadder(image1.shape)
         image1, image2 = padder.pad(image1, image2)
-        if init_flow is not None:
-            init_flow = init_flow.to("cuda").to(torch.float32)
-            (init_flow,) = padder.pad(einops.rearrange(init_flow, "xy H W -> 1 xy H W", xy=2))
-            init_flow = downsample_flow_8(init_flow)
 
         all_predictions = self.model(
             image1,
             image2,
             iters=self.flow_iters,
             test_mode=True,
-            flow_init=init_flow,
-            vis_debug=vis_debug,
         )
 
-        flow_pre = padder.unpad(all_predictions["flow"])
-        flow = flow_pre[0]  # xy, H, W
-        assert flow.shape == (2, H, W)
-        occlusions = torch.squeeze(
-            padder.unpad(all_predictions["occlusion"].softmax(dim=1)[:, 1:2, :, :]), dim=0
-        )
-        uncertainty_pred = torch.squeeze(padder.unpad(all_predictions["uncertainty"]), dim=0)
+        flow = padder.unpad(all_predictions["flow"])  # (1, 2, H, W)
+        occlusions = padder.unpad(
+            all_predictions["occlusion"].softmax(dim=1)[:, 1:2, :, :]
+        )  # (1, 1, H, W)
+        uncertainty_pred = padder.unpad(all_predictions["uncertainty"])  # (1, 1, H, W)
         sigma = torch.sqrt(torch.exp(uncertainty_pred))
 
-        if mode == "flow":
-            if numpy_out:
-                flow = ensure_numpy(flow)
-                occlusions = ensure_numpy(occlusions)
-                sigma = ensure_numpy(sigma)
-
-            extra_outputs = {
-                "occlusion": occlusions,
-                "sigma": sigma,
-                "debug": all_predictions.get("debug", None),
-            }
-            return flow, extra_outputs
-
-        elif mode == "TC":
-            flow_flat = einops.rearrange(flow, "delta H W -> delta (H W)", delta=2)
-            flow_shape = einops.parse_shape(flow, "delta H W")
-            self.last_flow_shape = flow_shape
-            if isinstance(flow_flat, torch.Tensor):
-                src_coords = torch_get_featuremap_coords(
-                    (flow_shape["H"], flow_shape["W"]), device=flow_flat.device
-                )
-            else:
-                src_coords = get_featuremap_coords((flow_shape["H"], flow_shape["W"]))
-            dst_coords = src_coords + flow_flat
-
-            if numpy_out:
-                src_coords = ensure_numpy(src_coords)
-                dst_coords = ensure_numpy(dst_coords)
-                occlusions = ensure_numpy(einops.rearrange(occlusions, "1 H W -> (H W)"))
-                sigma = ensure_numpy(einops.rearrange(sigma, "1 H W -> (H W)"))
-
-            extra_outputs = {
-                "occlusion": occlusions,
-                "sigma": sigma,
-                "debug": all_predictions.get("debug", None),
-            }
-            return src_coords, dst_coords, extra_outputs
+        return flow, occlusions, sigma
 
 
 def downsample_flow_8(flow, mode="bilinear"):

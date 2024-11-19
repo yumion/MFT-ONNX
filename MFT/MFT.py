@@ -18,7 +18,6 @@ class MFT(nn.Module):
     def __init__(
         self,
         checkpoint_path: str = "checkpoints/raft-things-sintel-kubric-splitted-occlusion-uncertainty-non-occluded-base-sintel.pth",
-        tracking_level: int = 1,
         flow_iters: int = 12,
         occlusion_module: str = "separate_with_uncertainty",
         small: bool = False,
@@ -29,6 +28,7 @@ class MFT(nn.Module):
         device: str = "cuda",
     ):
         """Create MFT tracker"""
+        super().__init__()
         self.flower = RAFTWrapper(
             checkpoint_path=checkpoint_path,
             occlusion_module=occlusion_module,
@@ -40,7 +40,6 @@ class MFT(nn.Module):
         self.occlusion_threshold = occlusion_threshold
         self.deltas = deltas
         self.timers_enabled = timers_enabled
-        self.cache_delta_infinity = None
 
     def init(self, img, start_frame_i=0, time_direction=1, flow_cache=None, **kwargs):
         """Initialize MFT on first frame
@@ -55,7 +54,7 @@ class MFT(nn.Module):
         returns:
           meta: initial frame result container, with initial (zero-motion) MFT.results.FlowOUTrackingResult in meta.result
         """
-        self.img_H, self.img_W = img.shape[:2]
+        self.img_H, self.img_W = img.shape[2:]
         self.start_frame_i = start_frame_i
         self.current_frame_i = self.start_frame_i
         assert time_direction in [+1, -1]
@@ -71,7 +70,7 @@ class MFT(nn.Module):
             }
         }
 
-        self.template_img = img.copy()
+        self.template_img = img.clone()
 
         meta = SimpleNamespace()
         meta.result = self.memory[self.start_frame_i]["result"].clone().cpu()
@@ -122,19 +121,8 @@ class MFT(nn.Module):
 
             template_to_left = self.memory[left_id]["result"]
 
-            flow_init = None
-            use_cache = np.isfinite(delta) or self.cache_delta_infinity
-            left_to_right = get_flowou_with_cache(
-                self.flower,
-                left_img,
-                right_img,
-                flow_init,
-                self.flow_cache,
-                left_id,
-                right_id,
-                read_cache=use_cache,
-                write_cache=use_cache,
-            )
+            flow_left_to_right, occlusions, sigmas = self.flower(left_img, right_img)
+            left_to_right = FlowOUTrackingResult(flow_left_to_right[0], occlusions[0], sigmas[0])
 
             chain_timer.start()
             delta_results[delta] = chain_results(template_to_left, left_to_right)
@@ -244,60 +232,6 @@ class MFT(nn.Module):
             (self.time_direction > 0 and frame_i < self.start_frame_i)  # forward
             or (self.time_direction < 0 and frame_i > self.start_frame_i)
         )  # backward
-
-
-# @profile
-def get_flowou_with_cache(
-    flower,
-    left_img,
-    right_img,
-    flow_init=None,
-    cache=None,
-    left_id=None,
-    right_id=None,
-    read_cache=False,
-    write_cache=False,
-):
-    """Compute flow from left_img to right_img. Possibly with caching.
-
-    args:
-        flower: flow wrapper
-        left_img: (H, W, 3) BGR np.uint8 image
-        right_img: (H, W, 3) BGR np.uint8 image
-        flow_init: [optional] (2, H, W) tensor with flow initialisation (caching is disabled when flow_init used)
-        cache: [optional] cache object with
-        left_id: [optional] frame number of left_img
-        right_id: [optional] frame number of right_img
-        read_cache: [optional] enable loading from flow cache
-        write_cache: [optional] enable writing into flow cache
-
-    returns:
-        flowou: FlowOUTrackingResult
-    """
-    must_compute = not read_cache
-    if read_cache and flow_init is None:
-        # attempt loading cached flow
-        assert left_id is not None
-        assert right_id is not None
-
-        try:
-            assert cache is not None
-            flow_left_to_right, occlusions, sigmas = cache.read(left_id, right_id)
-            assert flow_left_to_right is not None
-        except Exception:
-            must_compute = True
-
-    if must_compute:  # read_cache == False, flow not cached yet, or some cache read error
-        # print(f'computing flow {left_id}->{right_id}')
-        flow_left_to_right, extra = flower.compute_flow(
-            left_img, right_img, mode="flow", init_flow=flow_init
-        )
-        occlusions, sigmas = extra["occlusion"], extra["sigma"]
-
-    if (cache is not None) and write_cache and must_compute and (flow_init is None):
-        cache.write(left_id, right_id, flow_left_to_right, occlusions, sigmas)
-    flowou = FlowOUTrackingResult(flow_left_to_right, occlusions, sigmas)
-    return flowou
 
 
 def chain_results(left_result, right_result):

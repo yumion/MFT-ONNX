@@ -70,20 +70,28 @@ def run(args):
     results = []
 
     logger.info("Starting tracking")
-    for frame in tqdm(
-        io_utils.get_video_frames(args.video), total=io_utils.get_video_length(args.video)
+    for i, frame in tqdm(
+        enumerate(io_utils.get_video_frames(args.video)), total=io_utils.get_video_length(args.video)
     ):
+        input_tensor = einops.rearrange(
+            torch.from_numpy(frame[:, :, ::-1].copy()), "H W C -> 1 C H W", C=3
+        )
+        input_tensor = input_tensor.cuda().float()
+
         if not initialized:
-            meta = tracker.init(frame)
+            meta = tracker.init(input_tensor)
             initialized = True
             queries = get_queries(frame.shape[:2], args.grid_spacing)
         else:
-            meta = tracker.track(frame)
+            meta = tracker.track(input_tensor)
 
         coords, occlusions = convert_to_point_tracking(meta.result, queries)
         result = meta.result
         result.cpu()
         results.append((result, coords, occlusions))
+
+        if i > 30:
+            break
 
     edit = None
     if args.edit.exists():
@@ -118,6 +126,10 @@ def run(args):
         point_writer.write(dot_vis)
         if edit is not None:
             edit_writer.write(edit_vis)
+
+        if frame_i > 30:
+            break
+
     point_writer.close()
     if edit is not None:
         edit_writer.close()
@@ -170,10 +182,10 @@ def draw_edit(frame, result, edit):
     return vis
 
 
-from ipdb import iex
+# from ipdb import iex
 
 
-@iex
+# @iex
 def main():
     args = parse_arguments()
     return run(args)

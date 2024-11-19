@@ -19,24 +19,16 @@ Please cite our paper, if you use any of this.
 
 
 ## Install
-
-Create and activate a new virtualenv:
-
-    # we have tested with python 3.7.4
-    python -m venv venv
-    source venv/bin/activate
-
-Then install all the dependencies:
-
-    pip install torch numpy einops tqdm opencv-python scipy Pillow==9 matplotlib ipdb
-
+```
+poetry install
+```
 
 ## Run the demo
 
 Simply running:
-
-    python demo.py
-
+```
+poetry run python demo.py
+```
 should produce a `demo_out` directory with two visualizations.
 
 
