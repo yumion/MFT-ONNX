@@ -75,7 +75,7 @@ def run(args):
     ):
         input_tensor = einops.rearrange(
             torch.from_numpy(frame[:, :, ::-1].copy()), "H W C -> 1 C H W", C=3
-        )
+        )  # BGR -> RGB, HWC -> BCHW
         input_tensor = input_tensor.cuda().float()
 
         if not initialized:
