@@ -82,11 +82,9 @@ def run(args):
         input_tensor = input_tensor.cuda().float()
 
         if not initialized:
-            meta = tracker.init(input_tensor)
-            initialized = True
             queries = get_queries(frame.shape[:2], args.grid_spacing)
-        else:
-            meta = tracker.track(input_tensor)
+            initialized = True
+        meta = tracker(input_tensor)
 
         coords, occlusions = convert_to_point_tracking(meta.result, queries)
         result = meta.result

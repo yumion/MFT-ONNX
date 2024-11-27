@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import einops
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,10 +14,6 @@ class MFT(nn.Module):
         flower: nn.Module,
         start_frame_i: int = 0,
         time_direction: int = 1,
-        flow_iters: int = 12,
-        occlusion_module: str = "separate_with_uncertainty",
-        small: bool = False,
-        mixed_precision: bool = False,
         occlusion_threshold: float = 0.02,
         deltas: list[int] = [np.inf, 1, 2, 4, 8, 16, 32],
         device: str = "cuda",
@@ -27,10 +24,6 @@ class MFT(nn.Module):
             checkpoint_path: RAFTの学習済みモデルのパス
             start_frame_i: 初期フレームのインデックス
             time_direction: フレームの進む方向 (+1: 前方, -1: 後方)
-            flow_iters: RAFTの反復回数
-            occlusion_module: オクルージョンモジュールのタイプ
-            small: 小型モデルを使うかどうか
-            mixed_precision: 混合精度モードを使うかどうか
             occlusion_threshold: オクルージョンの閾値
             deltas: フレーム間の間隔を表すリスト
             device: デバイス (CPU/GPU)
@@ -60,19 +53,22 @@ class MFT(nn.Module):
             meta: 初期フレームに関する結果 (SimpleNamespace)
         """
         # フレームの高さと幅を記録
-        img_H, img_W = img.shape[2:]
+        self.img_H, self.img_W = img.shape[2:]
 
         # メモリに初期フレームを保存
         self.memory = {
             self.start_frame_i: {
                 "img": img,
-                "result": FlowOUTrackingResult.identity((img_H, img_W), device=self.device),
+                "result": FlowOUTrackingResult.identity(
+                    (self.img_H, self.img_W), device=self.device
+                ),
             }
         }
 
         # 初期化結果を返す
         meta = SimpleNamespace()
         meta.result = self.memory[self.start_frame_i]["result"].clone().cpu()
+        self.current_frame_i += self.time_direction  # 現在のフレームのインデックスを更新
         return meta
 
     def track(self, input_img, **kwargs):
@@ -84,7 +80,6 @@ class MFT(nn.Module):
             meta: 現在のフレームに関する追跡結果
         """
         meta = SimpleNamespace()
-        self.current_frame_i += self.time_direction  # 現在のフレームのインデックスを更新
 
         # 複数の`delta`（フレーム間の距離）に基づくOptical Flowを計算
         delta_results = {}
@@ -118,22 +113,70 @@ class MFT(nn.Module):
             delta_results[delta] = chain_results(template_to_left, left_to_right)
             already_used_left_ids.append(left_id)
 
-        # ベストなデルタを選択
-        scores = -torch.stack([delta_results[delta].sigma for delta in self.deltas])
-        scores[
-            torch.stack([delta_results[delta].occlusion for delta in self.deltas])
-            > self.occlusion_threshold
-        ] = -float("inf")
-        best_delta_idx = torch.argmax(scores, dim=0)
-        best_result = delta_results[self.deltas[best_delta_idx.item()]]
+        used_deltas = sorted(
+            list(delta_results.keys()), key=lambda delta: 0 if np.isinf(delta) else delta
+        )
+        all_results = [delta_results[delta] for delta in used_deltas]
+        all_flows = torch.stack(
+            [result.flow for result in all_results], dim=0
+        )  # (N_delta, xy, H, W)
+        all_sigmas = torch.stack(
+            [result.sigma for result in all_results], dim=0
+        )  # (N_delta, 1, H, W)
+        all_occlusions = torch.stack(
+            [result.occlusion for result in all_results], dim=0
+        )  # (N_delta, 1, H, W)
 
-        # 結果を更新
-        self.memory[self.current_frame_i] = {"img": input_img, "result": best_result}
+        scores = -all_sigmas
+        scores[all_occlusions > self.occlusion_threshold] = -float("inf")
+
+        best = scores.max(dim=0, keepdim=True)
+        selected_delta_i = best.indices  # (1, 1, H, W)
+
+        best_flow = all_flows.gather(
+            dim=0,
+            index=einops.repeat(
+                selected_delta_i,
+                "N_delta 1 H W -> N_delta xy H W",
+                xy=2,
+                H=self.img_H,
+                W=self.img_W,
+            ),
+        )
+        best_occlusions = all_occlusions.gather(dim=0, index=selected_delta_i)
+        best_sigmas = all_sigmas.gather(dim=0, index=selected_delta_i)
+        selected_flow, selected_occlusion, selected_sigmas = (
+            best_flow,
+            best_occlusions,
+            best_sigmas,
+        )
+
+        selected_flow = einops.rearrange(
+            selected_flow, "1 xy H W -> xy H W", xy=2, H=self.img_H, W=self.img_W
+        )
+        selected_occlusion = einops.rearrange(
+            selected_occlusion, "1 1 H W -> 1 H W", H=self.img_H, W=self.img_W
+        )
+        selected_sigmas = einops.rearrange(
+            selected_sigmas, "1 1 H W -> 1 H W", H=self.img_H, W=self.img_W
+        )
+
+        result = FlowOUTrackingResult(selected_flow, selected_occlusion, selected_sigmas)
+
+        # mark flows pointing outside of the current image as occluded
+        invalid_mask = einops.rearrange(result.invalid_mask(), "H W -> 1 H W")
+        result.occlusion[invalid_mask] = 1
+
+        out_result = result.clone()
+
+        meta.result = out_result
+        meta.result.cpu()
+
+        self.memory[self.current_frame_i] = {"img": input_img, "result": result}
 
         # 不要なメモリをクリーンアップ
         self.cleanup_memory()
-
-        meta.result = best_result.clone().cpu()
+        self.current_frame_i += self.time_direction  # 現在のフレームのインデックスを更新
         return meta
 
     # @profile
