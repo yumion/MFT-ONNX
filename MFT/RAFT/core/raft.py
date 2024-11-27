@@ -4,15 +4,19 @@ import torch.nn.functional as F
 
 from MFT.RAFT.core.corr import AlternateCorrBlock, CorrBlock
 from MFT.RAFT.core.extractor import BasicEncoder, SmallEncoder
-from MFT.RAFT.core.update import BasicUpdateBlock, OcclusionAndUncertaintyBlock, SmallUpdateBlock
+from MFT.RAFT.core.update import (
+    BasicUpdateBlock,
+    OcclusionAndUncertaintyBlock,
+    SmallUpdateBlock,
+)
 from MFT.RAFT.core.utils.utils import coords_grid, upflow8, upsample8
 
 try:
-    autocast = torch.cuda.amp.autocast
+    autocast = torch.amp.autocast
 except:
     # dummy autocast for PyTorch < 1.6
     class autocast:
-        def __init__(self, enabled):
+        def __init__(self, device, enabled):
             pass
 
         def __enter__(self):
@@ -163,7 +167,7 @@ class RAFT(nn.Module):
         cdim = self.context_dim
 
         # run the feature network
-        with autocast(enabled=self.mixed_precision):
+        with autocast("cuda", enabled=self.mixed_precision):
             fmap1, fmap2 = self.fnet([image1, image2])
 
         fmap1 = fmap1.float()
@@ -179,7 +183,7 @@ class RAFT(nn.Module):
             )
 
         # run the context network
-        with autocast(enabled=self.mixed_precision):
+        with autocast("cuda", enabled=self.mixed_precision):
             cnet = self.cnet(image1)
             net, inp = torch.split(cnet, [hdim, cdim], dim=1)
             net = torch.tanh(net)
@@ -214,7 +218,7 @@ class RAFT(nn.Module):
             corr = corr_fn(coords1)  # index correlation volume
 
             flow = coords1 - coords0
-            with autocast(enabled=self.mixed_precision):
+            with autocast("cuda", enabled=self.mixed_precision):
                 net, up_mask, delta_flow, motion_features = self.update_block(net, inp, corr, flow)
 
             # F(t+1) = F(t) + \Delta(t)

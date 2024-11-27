@@ -30,7 +30,7 @@ class RAFTWrapper(nn.Module):
                 mixed_precision=mixed_precision,
             )
         )
-        model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+        model.load_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
 
         model = model.module
         model.requires_grad_(False)

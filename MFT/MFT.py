@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import einops
 import numpy as np
 import torch
@@ -64,12 +62,8 @@ class MFT(nn.Module):
                 ),
             }
         }
-
-        # 初期化結果を返す
-        meta = SimpleNamespace()
-        meta.result = self.memory[self.start_frame_i]["result"].clone().cpu()
         self.current_frame_i += self.time_direction  # 現在のフレームのインデックスを更新
-        return meta
+        return self.memory[self.start_frame_i]["result"].clone()
 
     def track(self, input_img, **kwargs):
         """1フレームを追跡
@@ -79,7 +73,6 @@ class MFT(nn.Module):
         Returns:
             meta: 現在のフレームに関する追跡結果
         """
-        meta = SimpleNamespace()
 
         # 複数の`delta`（フレーム間の距離）に基づくOptical Flowを計算
         delta_results = {}
@@ -167,17 +160,12 @@ class MFT(nn.Module):
         invalid_mask = einops.rearrange(result.invalid_mask(), "H W -> 1 H W")
         result.occlusion[invalid_mask] = 1
 
-        out_result = result.clone()
-
-        meta.result = out_result
-        meta.result.cpu()
-
         self.memory[self.current_frame_i] = {"img": input_img, "result": result}
 
         # 不要なメモリをクリーンアップ
         self.cleanup_memory()
         self.current_frame_i += self.time_direction  # 現在のフレームのインデックスを更新
-        return meta
+        return result.clone()
 
     # @profile
     def cleanup_memory(self):

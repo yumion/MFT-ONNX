@@ -84,10 +84,9 @@ def run(args):
         if not initialized:
             queries = get_queries(frame.shape[:2], args.grid_spacing)
             initialized = True
-        meta = tracker(input_tensor)
+        result = tracker(input_tensor)
 
-        coords, occlusions = convert_to_point_tracking(meta.result, queries)
-        result = meta.result
+        coords, occlusions = convert_to_point_tracking(result, queries)
         result.cpu()
         results.append((result, coords, occlusions))
 
