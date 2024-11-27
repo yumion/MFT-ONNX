@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from MFT.MFT import MFT
 from MFT.point_tracking import convert_to_point_tracking
+from MFT.raft import RAFTWrapper
 from MFT.utils.misc import ensure_numpy
 from tqdm import tqdm
 
@@ -61,7 +62,8 @@ def parse_arguments():
 
 def run(args):
     logger.info("Loading tracker")
-    tracker = MFT(args.checkpoint)
+    flower = RAFTWrapper(checkpoint_path=args.checkpoint)
+    tracker = MFT(flower)
     logger.info("Tracker loaded")
 
     initialized = False
@@ -71,7 +73,8 @@ def run(args):
 
     logger.info("Starting tracking")
     for i, frame in tqdm(
-        enumerate(io_utils.get_video_frames(args.video)), total=io_utils.get_video_length(args.video)
+        enumerate(io_utils.get_video_frames(args.video)),
+        total=io_utils.get_video_length(args.video),
     ):
         input_tensor = einops.rearrange(
             torch.from_numpy(frame[:, :, ::-1].copy()), "H W C -> 1 C H W", C=3

@@ -1,90 +1,74 @@
-# -*- origami-fold-style: triple-braces; coding: utf-8; -*-
-import logging
 from types import SimpleNamespace
 
-import einops
 import numpy as np
 import torch
 import torch.nn as nn
 
-from MFT.raft import RAFTWrapper
 from MFT.results import FlowOUTrackingResult
-from MFT.utils.timing import general_time_measurer
-
-logger = logging.getLogger(__name__)
 
 
 class MFT(nn.Module):
     def __init__(
         self,
-        checkpoint_path: str = "checkpoints/raft-things-sintel-kubric.pth",
+        flower: nn.Module,
+        start_frame_i: int = 0,
+        time_direction: int = 1,
         flow_iters: int = 12,
         occlusion_module: str = "separate_with_uncertainty",
         small: bool = False,
         mixed_precision: bool = False,
         occlusion_threshold: float = 0.02,
         deltas: list[int] = [np.inf, 1, 2, 4, 8, 16, 32],
-        timers_enabled: bool = False,
         device: str = "cuda",
     ):
         """MFTクラスの初期化
 
         Args:
             checkpoint_path: RAFTの学習済みモデルのパス
+            start_frame_i: 初期フレームのインデックス
+            time_direction: フレームの進む方向 (+1: 前方, -1: 後方)
             flow_iters: RAFTの反復回数
             occlusion_module: オクルージョンモジュールのタイプ
             small: 小型モデルを使うかどうか
             mixed_precision: 混合精度モードを使うかどうか
             occlusion_threshold: オクルージョンの閾値
             deltas: フレーム間の間隔を表すリスト
-            timers_enabled: 処理時間計測を有効化するかどうか
             device: デバイス (CPU/GPU)
         """
         super().__init__()
-        # Optical Flowを計算するRAFTモデルを初期化
-        self.flower = RAFTWrapper(
-            checkpoint_path=checkpoint_path,
-            occlusion_module=occlusion_module,
-            small=small,
-            mixed_precision=mixed_precision,
-            flow_iters=flow_iters,
-        )
+        self.flower = flower
+        assert time_direction in [+1, -1]
+        self.time_direction = time_direction
         self.device = device
         self.occlusion_threshold = occlusion_threshold
         self.deltas = deltas
-        self.timers_enabled = timers_enabled
+        self.start_frame_i = start_frame_i
+        self.current_frame_i = start_frame_i
 
-    def init(self, img, start_frame_i=0, time_direction=1, flow_cache=None, **kwargs):
+    def forward(self, img: torch.Tensor, **kwargs):
+        if self.current_frame_i == self.start_frame_i:
+            return self.init(img, self.start_frame_i, **kwargs)
+        return self.track(img, **kwargs)
+
+    def init(self, img, start_frame_i=0, **kwargs):
         """初期化処理
 
         Args:
             img: 初期フレーム (torch.Tensor, 形状: [B, C, H, W])
             start_frame_i: 初期フレームのインデックス
-            time_direction: フレームの進む方向 (+1: 前方, -1: 後方)
-            flow_cache: Optical Flowのキャッシュオブジェクト
         Returns:
             meta: 初期フレームに関する結果 (SimpleNamespace)
         """
         # フレームの高さと幅を記録
-        self.img_H, self.img_W = img.shape[2:]
-        self.start_frame_i = start_frame_i
-        self.current_frame_i = self.start_frame_i
-        assert time_direction in [+1, -1]
-        self.time_direction = time_direction
-        self.flow_cache = flow_cache
+        img_H, img_W = img.shape[2:]
 
         # メモリに初期フレームを保存
         self.memory = {
             self.start_frame_i: {
                 "img": img,
-                "result": FlowOUTrackingResult.identity(
-                    (self.img_H, self.img_W), device=self.device
-                ),
+                "result": FlowOUTrackingResult.identity((img_H, img_W), device=self.device),
             }
         }
-
-        # テンプレート画像として初期フレームを保持
-        self.template_img = img.clone()
 
         # 初期化結果を返す
         meta = SimpleNamespace()
@@ -105,13 +89,10 @@ class MFT(nn.Module):
         # 複数の`delta`（フレーム間の距離）に基づくOptical Flowを計算
         delta_results = {}
         already_used_left_ids = []
-        chain_timer = general_time_measurer(
-            "chain", cuda_sync=True, start_now=False, active=self.timers_enabled
-        )
+
         for delta in self.deltas:
             # フレームペア（left_id, right_id）を計算
             left_id = self.current_frame_i - delta * self.time_direction
-            right_id = self.current_frame_i
 
             # 初期フレームを超える場合の処理
             if self.is_before_start(left_id):
@@ -134,10 +115,8 @@ class MFT(nn.Module):
             left_to_right = FlowOUTrackingResult(flow_left_to_right[0], occlusions[0], sigmas[0])
 
             # 結果のチェーン処理
-            chain_timer.start()
             delta_results[delta] = chain_results(template_to_left, left_to_right)
             already_used_left_ids.append(left_id)
-            chain_timer.stop()
 
         # ベストなデルタを選択
         scores = -torch.stack([delta_results[delta].sigma for delta in self.deltas])
@@ -187,9 +166,10 @@ class MFT(nn.Module):
 
     def is_before_start(self, frame_i):
         """フレームが初期フレームより前かどうかを判定"""
-        return (self.time_direction > 0 and frame_i < self.start_frame_i) or (
-            self.time_direction < 0 and frame_i > self.start_frame_i
-        )
+        if self.time_direction > 0:
+            return frame_i < self.start_frame_i
+        elif self.time_direction < 0:
+            return frame_i > self.start_frame_i
 
 
 def chain_results(left_result, right_result):
